@@ -1,0 +1,377 @@
+@page "/"
+@using DevOpsProjectMigrator.Models
+@using DevOpsProjectMigrator.Services
+@using Microsoft.Identity.Web
+@inject MicrosoftIdentityConsentAndConditionalAccessHandler ConsentHandler
+@inject IServiceProvider Services
+@inject IConfiguration Configuration
+
+<PageTitle>Project migration</PageTitle>
+
+<div class="migration-shell">
+    <div class="d-flex justify-content-between align-items-start flex-wrap gap-3 mb-4">
+        <div>
+            <p class="eyebrow mb-2">AZURE DEVOPS · CROSS-TENANT</p>
+            <h1>Project migration</h1>
+            <p class="text-secondary mb-0">Move project content between Azure DevOps organizations.</p>
+        </div>
+        @if (isSignedIn)
+        {
+            <a class="btn btn-outline-secondary" href="/logout">Sign out</a>
+        }
+    </div>
+
+    @if (!isConfigured)
+    {
+        <div class="alert alert-warning">
+            <h2 class="h5">Microsoft Entra app registration required</h2>
+            <p class="mb-2"><code>AzureAd:ClientId</code> must be the Application (client) ID GUID from the app registration overview. <code>AzureAd:ClientSecret</code> must be a newly rotated secret value.</p>
+            <p class="mb-0">Store both with user-secrets or environment variables. Register a confidential web app, use <code>https://localhost:7112/signin-oidc</code> as its redirect URI, and grant Azure DevOps delegated permission.</p>
+        </div>
+    }
+    else if (!isSignedIn)
+    {
+        <div class="card shadow-sm"><div class="card-body p-4">
+            <h2 class="h4">Sign in to continue</h2>
+            <p class="text-secondary">Sign in with a Microsoft Entra account that has access to both Azure DevOps organizations.</p>
+            <a class="btn btn-primary" href="/login">Sign in with Microsoft</a>
+        </div></div>
+    }
+    else
+    {
+        <div class="alert alert-info" role="note">
+            API-based organization-to-organization migration is not full fidelity. Work item IDs/history, permissions, service connections, build runs, and some package metadata might not be preserved. Review the report before using the destination in production.
+        </div>
+        @if (!string.IsNullOrWhiteSpace(message))
+        {
+            <div class="alert @(isError ? "alert-danger" : "alert-success")" role="status">@message</div>
+        }
+        <div class="row g-4">
+            <div class="col-12 col-xl-6">
+                <section class="card h-100 shadow-sm"><div class="card-body p-4">
+                    <div class="step-heading"><span>1</span><h2 class="h4 mb-0">Source organization</h2></div>
+                    <label class="form-label mt-3" for="sourceOrg">Organization</label>
+                    <input id="sourceOrg" class="form-control" @bind="request.SourceOrganization" placeholder="(enter source organization name from Devops URL..)" />
+                        <label class="form-label mt-3" for="sourceTenant">Microsoft Entra tenant ID</label> <a class="form-label mt-3" href="https://www.azuretenantlookup.com/" target="_blank">(Lookup Tenant ID)</a>
+                    <input id="sourceTenant" class="form-control" @bind="request.SourceTenantId" placeholder="00000000-0000-0000-0000-000000000000" />
+                    <button class="btn btn-outline-primary mt-3" @onclick="LoadSourceProjectsAsync" disabled="@isLoadingSource">
+                        @(isLoadingSource ? "Loading..." : "Load source projects")
+                    </button>
+                    @if (sourceProjects.Count > 0)
+                    {
+                        <label class="form-label mt-4" for="sourceProject">Source project</label>
+                        <select id="sourceProject" class="form-select" @bind="request.SourceProjectId">
+                            <option value="">Select a project</option>
+                            @foreach (var project in sourceProjects)
+                            {
+                                <option value="@project.Id">@project.Name</option>
+                            }
+                        </select>
+                    }
+                </div></section>
+            </div>
+            <div class="col-12 col-xl-6">
+                <section class="card h-100 shadow-sm"><div class="card-body p-4">
+                    <div class="step-heading"><span>2</span><h2 class="h4 mb-0">Destination organization</h2></div>
+                    <label class="form-label mt-3" for="destinationOrg">Organization</label>
+                        <input id="destinationOrg" class="form-control" @bind="request.DestinationOrganization" placeholder="(enter destination organization name from Devops URL..)" />
+                        <label class="form-label mt-3" for="destinationTenant">Microsoft Entra tenant ID</label> <a class="form-label mt-3" href="https://www.azuretenantlookup.com/" target="_blank">(Lookup Tenant ID)</a>
+                    <input id="destinationTenant" class="form-control" @bind="request.DestinationTenantId" placeholder="00000000-0000-0000-0000-000000000000" />
+                    <button class="btn btn-outline-primary mt-3" @onclick="LoadDestinationProjectsAsync" disabled="@isLoadingDestination">
+                        @(isLoadingDestination ? "Loading..." : "Load destination projects")
+                    </button>
+                    <div class="mt-4">
+                        <label class="form-label">Destination project</label>
+                        <div class="form-check"><input class="form-check-input" type="radio" name="destinationMode" id="createNew" checked="@(request.DestinationMode == DestinationMode.CreateNew)" @onchange="() => request.DestinationMode = DestinationMode.CreateNew" /><label class="form-check-label" for="createNew">Create a new project</label></div>
+                        <div class="form-check"><input class="form-check-input" type="radio" name="destinationMode" id="useExisting" checked="@(request.DestinationMode == DestinationMode.UseExisting)" @onchange="() => request.DestinationMode = DestinationMode.UseExisting" /><label class="form-check-label" for="useExisting">Use an existing project</label></div>
+                    </div>
+                    @if (request.DestinationMode == DestinationMode.CreateNew)
+                    {
+                        <label class="form-label mt-3" for="newProjectName">New project name</label>
+                        <input id="newProjectName" class="form-control" @bind="request.NewProjectName" />
+                        <label class="form-label mt-3" for="newProjectDescription">Description (optional)</label>
+                        <input id="newProjectDescription" class="form-control" @bind="request.NewProjectDescription" />
+                        <label class="form-label mt-3" for="processTemplate">Work process</label>
+                        <select id="processTemplate" class="form-select" @bind="request.ProcessTemplateId">
+                            @foreach (var process in destinationProcesses)
+                            {
+                                <option value="@process.Id">@process.Name</option>
+                            }
+                        </select>
+                    }
+                    else if (destinationProjects.Count > 0)
+                    {
+                        <label class="form-label mt-3" for="destinationProject">Destination project</label>
+                        <select id="destinationProject" class="form-select" @bind="request.DestinationProjectId">
+                            <option value="">Select a project</option>
+                            @foreach (var project in destinationProjects)
+                            {
+                                <option value="@project.Id">@project.Name</option>
+                            }
+                        </select>
+                    }
+                </div></section>
+            </div>
+        </div>
+        <section class="card shadow-sm mt-4"><div class="card-body p-4">
+            <div class="step-heading"><span>3</span><h2 class="h4 mb-0">Content to migrate</h2></div>
+            <div class="row g-3 mt-2">
+                @foreach (var category in Enum.GetValues<MigrationCategory>())
+                {
+                    <div class="col-12 col-md-6"><label class="category-option">
+                        <input class="form-check-input" type="checkbox" checked="@request.Categories.Contains(category)" @onchange="args => SetCategory(category, args.Value)" />
+                        <span><strong>@GetCategoryTitle(category)</strong><small>@GetCategoryDescription(category)</small></span>
+                    </label></div>
+                }
+            </div>
+            <button class="btn btn-primary mt-4" @onclick="ReviewMigration" disabled="@(!CanReview)">Review migration</button>
+            @if (showReview)
+            {
+                <div class="review-panel mt-4">
+                    <h3 class="h5">Review before starting</h3>
+                    <p class="mb-1"><strong>Source:</strong> @SelectedSourceName (@request.SourceOrganization)</p>
+                    <p class="mb-1"><strong>Destination:</strong> @(request.DestinationMode == DestinationMode.CreateNew ? request.NewProjectName : SelectedDestinationName) (@request.DestinationOrganization)</p>
+                    <p class="mb-0"><strong>Included:</strong> @string.Join(", ", request.Categories.Select(GetCategoryTitle))</p>
+                    <p class="small text-secondary mt-3">This is a best-effort migration. Existing destination projects can receive duplicate work items. Git repositories with existing refs will be skipped rather than overwritten.</p>
+                    <div class="form-check mt-3">
+                        <input id="confirmWrites" class="form-check-input" type="checkbox" @bind="confirmedWrite" />
+                        <label class="form-check-label" for="confirmWrites">I understand this will write data to the destination organization.</label>
+                    </div>
+                    <button class="btn btn-danger mt-3" @onclick="RunMigrationAsync" disabled="@(!confirmedWrite || isRunning)">
+                        @(isRunning ? "Migration running..." : "Start migration")
+                    </button>
+                </div>
+            }
+        </div></section>
+        @if (isRunning || !string.IsNullOrWhiteSpace(progressMessage))
+        {
+            <div class="alert alert-secondary mt-4" role="status">@progressMessage</div>
+        }
+        @if (report is not null)
+        {
+            <section class="card shadow-sm mt-4">
+                <div class="card-body p-4">
+                    <h2 class="h4">Migration report</h2>
+                    <p class="mb-3">@report.SourceProjectName → @report.DestinationProjectName</p>
+                    <div class="d-flex flex-wrap gap-2 mb-3">
+                        <span class="badge text-bg-success">@report.CompletedCount completed</span>
+                        <span class="badge text-bg-warning">@report.SkippedCount skipped</span>
+                        <span class="badge text-bg-danger">@report.FailedCount failed</span>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle">
+                            <thead><tr><th>Category</th><th>Item</th><th>Status</th><th>Details</th></tr></thead>
+                            <tbody>
+                                @foreach (var item in report.Items.Take(250))
+                                {
+                                    <tr>
+                                        <td>@item.Category</td>
+                                        <td>@item.Item</td>
+                                        <td>@item.Status</td>
+                                        <td>@item.Message</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                    @if (report.Items.Count > 250)
+                    {
+                        <p class="small text-secondary">Showing the first 250 of @report.Items.Count report entries.</p>
+                    }
+                </div>
+            </section>
+        }
+    }
+</div>
+
+@code {
+    private readonly MigrationRequest request = new();
+    private IReadOnlyList<AzureDevOpsProject> sourceProjects = [];
+    private IReadOnlyList<AzureDevOpsProject> destinationProjects = [];
+    private IReadOnlyList<ProjectProcessTemplate> destinationProcesses = [];
+    private AuthenticationState? authenticationState;
+    private bool isConfigured;
+    private bool isSignedIn;
+    private bool isLoadingSource;
+    private bool isLoadingDestination;
+    private bool showReview;
+    private bool confirmedWrite;
+    private bool isRunning;
+    private bool isError;
+    private string? message;
+    private string? progressMessage;
+    private MigrationReport? report;
+
+    private bool CanReview =>
+        Guid.TryParse(request.SourceProjectId, out _) &&
+        !string.IsNullOrWhiteSpace(request.SourceOrganization) &&
+        !string.IsNullOrWhiteSpace(request.DestinationOrganization) &&
+        Guid.TryParse(request.SourceTenantId, out _) &&
+        Guid.TryParse(request.DestinationTenantId, out _) &&
+        request.Categories.Count > 0 &&
+        (request.DestinationMode == DestinationMode.CreateNew
+            ? !string.IsNullOrWhiteSpace(request.NewProjectName) && Guid.TryParse(request.ProcessTemplateId, out _)
+            : Guid.TryParse(request.DestinationProjectId, out _));
+
+    private string SelectedSourceName => sourceProjects.FirstOrDefault(project => project.Id == request.SourceProjectId)?.Name ?? "Selected project";
+    private string SelectedDestinationName => destinationProjects.FirstOrDefault(project => project.Id == request.DestinationProjectId)?.Name ?? "Selected project";
+    private AzureDevOpsClient AzureDevOps => Services.GetRequiredService<AzureDevOpsClient>();
+    private MigrationEngine MigrationEngine => Services.GetRequiredService<MigrationEngine>();
+
+    protected override async Task OnInitializedAsync()
+    {
+        isConfigured = Guid.TryParse(Configuration["AzureAd:ClientId"], out _) && !string.IsNullOrWhiteSpace(Configuration["AzureAd:ClientSecret"]);
+        if (isConfigured && Services.GetService<AuthenticationStateProvider>() is { } authenticationProvider)
+        {
+            authenticationState = await authenticationProvider.GetAuthenticationStateAsync();
+            isSignedIn = authenticationState.User.Identity?.IsAuthenticated == true;
+        }
+    }
+
+    private async Task LoadSourceProjectsAsync()
+    {
+        isLoadingSource = true;
+        message = null;
+        try
+        {
+            sourceProjects = await AzureDevOps.ListProjectsAsync(request.SourceOrganization, request.SourceTenantId, authenticationState!.User);
+            message = $"Loaded {sourceProjects.Count} source project(s).";
+            isError = false;
+        }
+        catch (Exception exception)
+        {
+            if (exception.Source == "Microsoft.Identity.Web.TokenAcquisition")
+            {
+                //Application doesn't have permission to the Domain...
+                isConfigured = false;
+            }
+            else
+            ConsentHandler.HandleException(exception);
+//            HandleOperationException(exception);
+        }
+        finally
+        {
+            isLoadingSource = false;
+        }
+    }
+
+    private async Task RunMigrationAsync()
+    {
+        if (!CanReview || !confirmedWrite || authenticationState is null)
+        {
+            return;
+        }
+
+        isRunning = true;
+        report = null;
+        message = null;
+        progressMessage = "Preparing migration...";
+        Action<string> progress = status =>
+        {
+            progressMessage = status;
+            _ = InvokeAsync(StateHasChanged);
+        };
+        try
+        {
+            report = await MigrationEngine.RunAsync(request, authenticationState.User, progress);
+            message = $"Migration finished: {report.CompletedCount} completed, {report.SkippedCount} skipped, {report.FailedCount} failed.";
+            isError = report.FailedCount > 0;
+        }
+        catch (Exception exception)
+        {
+            HandleOperationException(exception);
+        }
+        finally
+        {
+            isRunning = false;
+        }
+    }
+
+    private async Task LoadDestinationProjectsAsync()
+    {
+        isLoadingDestination = true;
+        message = null;
+        try
+        {
+            destinationProjects = await AzureDevOps.ListProjectsAsync(request.DestinationOrganization, request.DestinationTenantId, authenticationState!.User);
+            destinationProcesses = await AzureDevOps.ListProcessesAsync(request.DestinationOrganization, request.DestinationTenantId, authenticationState.User);
+            if (!destinationProcesses.Any(process => process.Id == request.ProcessTemplateId))
+            {
+                request.ProcessTemplateId = destinationProcesses.FirstOrDefault(process => process.IsDefault)?.Id
+                    ?? destinationProcesses.FirstOrDefault()?.Id
+                    ?? string.Empty;
+            }
+            message = $"Loaded {destinationProjects.Count} destination project(s) and {destinationProcesses.Count} available process(es).";
+            isError = false;
+        }
+        catch (Exception exception)
+        {
+            HandleOperationException(exception);
+        }
+        finally
+        {
+            isLoadingDestination = false;
+        }
+    }
+
+    private void SetCategory(MigrationCategory category, object? value)
+    {
+        if (value is bool selected)
+        {
+            if (selected) request.Categories.Add(category);
+            else request.Categories.Remove(category);
+        }
+        showReview = false;
+    }
+
+    private void ReviewMigration()
+    {
+        showReview = CanReview;
+        if (!showReview)
+        {
+            message = "Complete the source, destination, and content selections before reviewing.";
+            isError = true;
+            return;
+        }
+        message = null;
+        isError = false;
+    }
+
+    private void ShowError(Exception exception)
+    {
+        message = exception.Message;
+        isError = true;
+    }
+
+    private void HandleOperationException(Exception exception)
+    {
+        if (exception is MicrosoftIdentityWebChallengeUserException)
+        {
+            Services.GetRequiredService<MicrosoftIdentityConsentAndConditionalAccessHandler>()
+                .HandleException(exception);
+            return;
+        }
+
+        ShowError(exception);
+    }
+
+    private static string GetCategoryTitle(MigrationCategory category) => category switch
+    {
+        MigrationCategory.GitRepositories => "Git repositories",
+        MigrationCategory.Wikis => "Project and code wikis",
+        MigrationCategory.Boards => "Boards and work items",
+        MigrationCategory.Pipelines => "Pipelines",
+        MigrationCategory.Artifacts => "Artifacts and feeds",
+        _ => category.ToString()
+    };
+
+    private static string GetCategoryDescription(MigrationCategory category) => category switch
+    {
+        MigrationCategory.GitRepositories => "Repositories, branches, and source history.",
+        MigrationCategory.Wikis => "Project wiki pages and published code wikis.",
+        MigrationCategory.Boards => "Work items and related Board data.",
+        MigrationCategory.Pipelines => "Pipeline definitions and associated configuration.",
+        MigrationCategory.Artifacts => "Azure Artifacts feeds and package content.",
+        _ => string.Empty
+    };
+}
